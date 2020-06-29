@@ -227,7 +227,7 @@ resource "aws_kms_key" "mykey" {
 resource "aws_s3_bucket" "b" {
   bucket        = var.bucket
   force_destroy = true
-
+  acl = "private"
   server_side_encryption_configuration {
     rule {
       apply_server_side_encryption_by_default {
@@ -251,6 +251,7 @@ resource "aws_s3_bucket" "b" {
     Environment = "Dev"
   }
 }
+
 resource "aws_db_subnet_group" "db_group" {
   name       = "db_group"
   subnet_ids = [aws_subnet.subnet1.id,aws_subnet.subnet2.id]
@@ -326,7 +327,13 @@ resource "aws_iam_policy" "mypolicy" {
 	"Version": "2012-10-17",
 	"Statement": [{
 		"Effect": "Allow",
-		"Action": "s3:*",
+		"Action": [
+      "s3:PutObject",
+      "s3:PutObjectAcl",
+      "s3:GetObject",
+      "s3:GetObjectAcl",
+      "s3:DeleteObject"
+    ],
 		"Resource": [
 			"arn:aws:s3:::web.abhi.thakkar",
 			"arn:aws:s3:::web.abhi.thakkar/*"
@@ -347,20 +354,21 @@ resource "aws_iam_instance_profile" "EC2Profile" {
   role = "${aws_iam_role.EC2_Role.name}"
 }
 
+# create Instance
 resource "aws_instance" "web" {
   ami                    = var.ami
   instance_type          = "t2.micro"
   subnet_id              = aws_subnet.subnet2.id
-  iam_instance_profile   = "EC2-CSYE6225"
-  key_name = "awsEc2_ssh_key"
+  iam_instance_profile   = "CodeDeployEC2ServiceRole"
+  key_name = var.key_name
   vpc_security_group_ids = [aws_security_group.my_sg.id]
   root_block_device {
     volume_size = 20
     volume_type = "gp2"
   }
-  # user_data = file("install.sh")
+  user_data = "${data.template_file.data.rendered}"
   tags = {
-    Name = " Instance"
+    Name = "Instance"
   }
 }
 
@@ -368,9 +376,438 @@ data "template_file" "data" {
   template = "${file("install.tpl")}"
 
   vars={
-    endpoint = "${aws_db_instance.default.endpoint}"
+    endpoint = trimsuffix("${aws_db_instance.default.endpoint}",":5432")
     a_key= var.a_key
     s_key= var.s_key
+    db_name = var.db_name
+    db_user = var.db_user
+    db_pass = var.db_pass
+    bucket = var.bucket
   }
 }
+
+
+# create IAM User 
+
+resource "aws_iam_user" "circleci" {
+  name = "CircleCi"
+  path = "/system/"
+
+  tags = {
+    tag-key = "tag-value"
+  }
+}
+
+resource "aws_iam_access_key" "circleci" {
+  user = "${aws_iam_user.circleci.name}"
+}
+
+
+
+
+#Policy for code deploy
+
+resource "aws_iam_user_policy" "CircleCI-Code-Deploy" {
+  name = "CircleCI-Code-Deploy"
+  user = "${aws_iam_user.circleci.name}"
+
+  policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+   {
+      "Effect": "Allow",
+      "Action": [
+        "codedeploy:RegisterApplicationRevision",
+        "codedeploy:GetApplicationRevision"
+      ],
+      "Resource": [
+        "arn:aws:codedeploy:var.region:682607698449:application:web_app"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "codedeploy:CreateDeployment",
+        "codedeploy:GetDeployment"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "codedeploy:GetDeploymentConfig"
+      ],
+      "Resource": [
+        "arn:aws:codedeploy:var.region:682607698449:deploymentconfig:CodeDeployDefault.OneAtATime",
+        "arn:aws:codedeploy:var.region:682607698449:deploymentconfig:CodeDeployDefault.HalfAtATime",
+        "arn:aws:codedeploy:var.region:682607698449:deploymentconfig:CodeDeployDefault.AllAtOnce"
+      ]
+    }
+  ]
+}
+EOF
+}
+
+
+
+resource "aws_iam_policy" "CodeDeploy-EC2-S3" {
+  name = "CodeDeploy-EC2-S3"
+ 
+  policy = jsonencode(
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Action": [
+                "s3:Get*",
+                "s3:List*"
+            ],
+            "Effect": "Allow",
+            "Resource": [
+              "*"
+              
+              ]
+        }
+    ]
+  }
+  )
+}
+
+resource "aws_iam_role_policy_attachment" "test-attach" {
+  role       = "${aws_iam_role.EC2_Role.name}"
+  policy_arn = "${aws_iam_policy.CodeDeploy-EC2-S3.arn}"
+}
+
+resource "aws_iam_user_policy" "CircleCI-Upload-To-S3" {
+  name = "CircleCI-Upload-To-S3"
+  user = "${aws_iam_user.circleci.name}"
+
+  policy = jsonencode(
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:Get*",
+                "s3:List*"
+            ],
+            "Resource": [
+                "arn:aws:s3:::codedeploy.abhithakkar.me",
+			          "arn:aws:s3:::codedeploy.abhithakkar.me/*"
+            ]
+        }
+    ]
+  }
+  )
+}
+
+resource "aws_iam_user_policy" "circleci-ec2-ami" {
+  name = "circleci-ec2-ami"
+  user = "${aws_iam_user.circleci.name}"
+
+  policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "ec2:AttachVolume",
+          "ec2:AuthorizeSecurityGroupIngress",
+          "ec2:CopyImage",
+          "ec2:CreateImage",
+          "ec2:CreateKeypair",
+          "ec2:CreateSecurityGroup",
+          "ec2:CreateSnapshot",
+          "ec2:CreateTags",
+          "ec2:CreateVolume",
+          "ec2:DeleteKeyPair",
+          "ec2:DeleteSecurityGroup",
+          "ec2:DeleteSnapshot",
+          "ec2:DeleteVolume",
+          "ec2:DeregisterImage",
+          "ec2:DescribeImageAttribute",
+          "ec2:DescribeImages",
+          "ec2:DescribeInstances",
+          "ec2:DescribeInstanceStatus",
+          "ec2:DescribeRegions",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeSnapshots",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeTags",
+          "ec2:DescribeVolumes",
+          "ec2:DetachVolume",
+          "ec2:GetPasswordData",
+          "ec2:ModifyImageAttribute",
+          "ec2:ModifyInstanceAttribute",
+          "ec2:ModifySnapshotAttribute",
+          "ec2:RegisterImage",
+          "ec2:RunInstances",
+          "ec2:StopInstances",
+          "ec2:TerminateInstances"
+        ],
+        "Resource": "*"
+      }
+  ]
+}
+EOF
+}
+
+#Create s3 bucket for codedeploy
+
+resource "aws_s3_bucket" "codedeployabhithakkar" {
+  bucket = "codedeploy.abhithakkar.me"
+  acl    = "private"
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        sse_algorithm     = "AES256"
+      }
+    }
+  }
+
+  lifecycle_rule {
+    prefix  = "config/"
+    enabled = true
+
+    noncurrent_version_transition {
+      days          = 30
+      storage_class = "STANDARD_IA"
+    }
+  }
+  tags = {
+    Name        = "codedeployabhithakkar"
+   
+  }
+}
+
+#create IAM role for CodeDeployEC2ServiceRole
+
+resource "aws_iam_role" "CodeDeployEC2ServiceRole" {
+  name = "CodeDeployEC2ServiceRole"
+
+  assume_role_policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": [
+          "ec2.amazonaws.com"
+        ]
+      },
+      "Action": [
+        "sts:AssumeRole"
+        
+      ]
+
+    }
+  ]
+}
+EOF
+
+  tags = {
+    name = "CodeDeployEC2ServiceRole"
+  }
+}
+
+#Create policy for the CodeDeployEC2ServiceRole
+
+resource "aws_iam_policy" "CodeDeployEC2ServiceRolepolicy" {
+  name   = "CodeDeployEC2ServiceRolepolicy"
+  # role   = aws_iam_role.EC2Role.id
+  policy = <<EOF
+{
+	"Version": "2012-10-17",
+	"Statement": [{
+		"Effect": "Allow",
+		"Action": [
+      "s3:PutObject",
+      "s3:PutObjectAcl",
+      "s3:GetObject",
+      "s3:GetObjectAcl",
+      "s3:DeleteObject"
+    ],
+		"Resource": [
+			"arn:aws:s3:::codedeploy.abhithakkar.me",
+			"arn:aws:s3:::codedeploy.abhithakkar.me/*"
+		]
+	}]
+}
+  EOF
+
+}
+
+resource "aws_iam_role_policy_attachment" "attach-policy-codedeplyeEC2" {
+  role       = "${aws_iam_role.CodeDeployEC2ServiceRole.name}"
+  policy_arn = "${aws_iam_policy.CodeDeployEC2ServiceRolepolicy.arn}"
+}
+
+resource "aws_iam_instance_profile" "CodeDeployeEC2Profile" {
+  name = "CodeDeployEC2ServiceRole"
+  role = "${aws_iam_role.CodeDeployEC2ServiceRole.name}"
+}
+
+# Create CodeDeploy Application 
+
+resource "aws_codedeploy_app" "csye6225-webapp" {
+  compute_platform = "Server"
+  name             = "csye6225-webapp"
+
+}
+
+#Create policy for the codedeployservicerole
+
+
+resource "aws_iam_role" "CodeDeployServiceRole" {
+  name = "CodeDeployServiceRole"
+
+  assume_role_policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": [
+          "codedeploy.amazonaws.com"
+        ]
+      },
+      "Action": [
+        "sts:AssumeRole"
+      ]
+    }
+  ]
+}
+EOF
+
+  tags = {
+    name = "CodeDeployServiceRole"
+  }
+}
+
+
+resource "aws_iam_role_policy_attachment" "CodeDeployServiceRole" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
+  role       = "${aws_iam_role.CodeDeployServiceRole.name}"
+}
+
+# resource "aws_codedeploy_app" "webapp" {
+#   name = "webapp"
+# }
+
+resource "aws_sns_topic" "webapp" {
+  name = "webapp-topic"
+}
+
+resource "aws_codedeploy_deployment_group" "csye6225-webapp-deployment" {
+  app_name              = "${aws_codedeploy_app.csye6225-webapp.name}"
+  deployment_group_name = "csye6225-webapp-deployment"
+  service_role_arn      = "${aws_iam_role.CodeDeployServiceRole.arn}"
+
+  
+  ec2_tag_filter {
+    key   = "Name"
+    type  = "KEY_AND_VALUE"
+    value = "Instance"
+  }
+
+  
+  deployment_style {
+    deployment_type   = "IN_PLACE"
+  }
+  
+  
+  deployment_config_name= "CodeDeployDefault.OneAtATime"
+
+
+  auto_rollback_configuration {
+    enabled = true
+    events  = ["DEPLOYMENT_FAILURE"]
+  }
+
+  alarm_configuration {
+    alarms  = ["my-alarm-name"]
+    enabled = true
+  }
+}
+
+#Create policy for the CodeDeployServiceRole
+
+resource "aws_iam_policy" "CodeDeployServiceRolepolicy" {
+  name   = "CodeDeployServiceRolepolicy"
+  # role   = aws_iam_role.EC2Role.id
+  policy = <<EOF
+{
+	"Version": "2012-10-17",
+	"Statement": [{
+		"Effect": "Allow",
+		"Action": [
+       "autoscaling:CompleteLifecycleAction",
+                "autoscaling:DeleteLifecycleHook",
+                "autoscaling:DescribeAutoScalingGroups",
+                "autoscaling:DescribeLifecycleHooks",
+                "autoscaling:PutLifecycleHook",
+                "autoscaling:RecordLifecycleActionHeartbeat",
+                "autoscaling:CreateAutoScalingGroup",
+                "autoscaling:UpdateAutoScalingGroup",
+                "autoscaling:EnableMetricsCollection",
+                "autoscaling:DescribeAutoScalingGroups",
+                "autoscaling:DescribePolicies",
+                "autoscaling:DescribeScheduledActions",
+                "autoscaling:DescribeNotificationConfigurations",
+                "autoscaling:DescribeLifecycleHooks",
+                "autoscaling:SuspendProcesses",
+                "autoscaling:ResumeProcesses",
+                "autoscaling:AttachLoadBalancers",
+                "autoscaling:AttachLoadBalancerTargetGroups",
+                "autoscaling:PutScalingPolicy",
+                "autoscaling:PutScheduledUpdateGroupAction",
+                "autoscaling:PutNotificationConfiguration",
+                "autoscaling:PutLifecycleHook",
+                "autoscaling:DescribeScalingActivities",
+                "autoscaling:DeleteAutoScalingGroup",
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceStatus",
+                "ec2:TerminateInstances",
+                "tag:GetResources",
+                "sns:Publish",
+                "cloudwatch:DescribeAlarms",
+                "cloudwatch:PutMetricAlarm",
+                "elasticloadbalancing:DescribeLoadBalancers",
+                "elasticloadbalancing:DescribeInstanceHealth",
+                "elasticloadbalancing:RegisterInstancesWithLoadBalancer",
+                "elasticloadbalancing:DeregisterInstancesFromLoadBalancer",
+                "elasticloadbalancing:DescribeTargetGroups",
+                "elasticloadbalancing:DescribeTargetHealth",
+                "elasticloadbalancing:RegisterTargets",
+                "elasticloadbalancing:DeregisterTargets"
+    ],
+		"Resource": [
+			"arn:aws:s3:::codedeploy.abhithakkar.me",
+			"arn:aws:s3:::codedeploy.abhithakkar.me/*"
+		]
+	}]
+}
+  EOF
+
+}
+
+
+resource "aws_iam_instance_profile" "CodeDeployServiceRole" {
+  name = "CodeDeployServiceRole"
+  role = "${aws_iam_role.CodeDeployServiceRole.name}"
+}
+
+
+
+
 
