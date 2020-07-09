@@ -354,12 +354,17 @@ resource "aws_iam_instance_profile" "EC2Profile" {
   role = "${aws_iam_role.EC2_Role.name}"
 }
 
+resource "aws_iam_role_policy_attachment" "cloud-watch-policy" {
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+  role       = "${aws_iam_role.EC2_Role.name}"
+}
+
 # create Instance
 resource "aws_instance" "web" {
   ami                    = var.ami
   instance_type          = "t2.micro"
   subnet_id              = aws_subnet.subnet2.id
-  iam_instance_profile   = "CodeDeployEC2ServiceRole"
+  iam_instance_profile   = "EC2-CSYE6225"
   key_name = var.key_name
   vpc_security_group_ids = [aws_security_group.my_sg.id]
   root_block_device {
