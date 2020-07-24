@@ -359,23 +359,23 @@ resource "aws_iam_role_policy_attachment" "cloud-watch-policy" {
   role       = "${aws_iam_role.EC2_Role.name}"
 }
 
-# create Instance
-resource "aws_instance" "web" {
-  ami                    = var.ami
-  instance_type          = "t2.micro"
-  subnet_id              = aws_subnet.subnet2.id
-  iam_instance_profile   = "EC2-CSYE6225"
-  key_name = var.key_name
-  vpc_security_group_ids = [aws_security_group.my_sg.id]
-  root_block_device {
-    volume_size = 20
-    volume_type = "gp2"
-  }
-  user_data = "${data.template_file.data.rendered}"
-  tags = {
-    Name = "Instance"
-  }
-}
+# #create Instance
+# resource "aws_instance" "web" {
+#   ami                    = var.ami
+#   instance_type          = "t2.micro"
+#   subnet_id              = aws_subnet.subnet2.id
+#   iam_instance_profile   = "EC2-CSYE6225"
+#   key_name = var.key_name
+#   vpc_security_group_ids = [aws_security_group.my_sg.id]
+#   root_block_device {
+#     volume_size = 20
+#     volume_type = "gp2"
+#   }
+#   user_data = "${data.template_file.data.rendered}"
+#   tags = {
+#     Name = "Instance"
+#   }
+# }
 
 data "template_file" "data" {
   template = "${file("install.tpl")}"
@@ -732,6 +732,7 @@ resource "aws_codedeploy_deployment_group" "csye6225-webapp-deployment" {
   
   
   deployment_config_name= "CodeDeployDefault.OneAtATime"
+   autoscaling_groups = [aws_autoscaling_group.autoscale-group.id]
 
 
   auto_rollback_configuration {
@@ -739,10 +740,21 @@ resource "aws_codedeploy_deployment_group" "csye6225-webapp-deployment" {
     events  = ["DEPLOYMENT_FAILURE"]
   }
 
-  alarm_configuration {
-    alarms  = ["my-alarm-name"]
-    enabled = true
+  load_balancer_info {
+    target_group_pair_info {
+      prod_traffic_route {
+        listener_arns = [aws_lb_listener.lb-listener.arn]
+      }
+      target_group {
+        name = aws_lb_target_group.lb-target-group.name
+      }
+    }
   }
+
+  # alarm_configuration {
+  #   alarms  = ["my-alarm-name"]
+  #   enabled = true
+  # }
 }
 
 #Create policy for the CodeDeployServiceRole
@@ -812,7 +824,268 @@ resource "aws_iam_instance_profile" "CodeDeployServiceRole" {
   role = "${aws_iam_role.CodeDeployServiceRole.name}"
 }
 
+#Create launch configurations for EC2 Instance
+
+resource "aws_launch_configuration" "asg_launch_config" {
+  //name_prefix   = "asg_launch_config"
+  image_id                    = var.ami
+  instance_type               = "t2.micro"
+  key_name                    = var.key_name
+  user_data                   = "${data.template_file.data.rendered}"
+  iam_instance_profile        = "EC2-CSYE6225"
+  name                        = "asg_launch_config"
+  security_groups             = [aws_security_group.my_sg.id]
+  associate_public_ip_address = true
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Create Auto Scaling Group
+
+resource "aws_autoscaling_group" "autoscale-group" {
+  desired_capacity     = 2
+  max_size             = 4
+  min_size             = 2
+  default_cooldown     = 60
+  launch_configuration = aws_launch_configuration.asg_launch_config.name
+  vpc_zone_identifier  = [aws_subnet.subnet1.id,aws_subnet.subnet2.id]
+  target_group_arns    = [aws_lb_target_group.lb-target-group.arn]
+  tag {
+    key                 = "Name"
+    value               = "Instance"
+    propagate_at_launch = true
+  }
+}
+
+resource "aws_autoscaling_policy" "WebServerScaleUpPolicy" {
+  name                   = "WebServerScaleUpPolicy"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 60
+  autoscaling_group_name = "${aws_autoscaling_group.autoscale-group.name}"
+}
+
+resource "aws_cloudwatch_metric_alarm" "CPUAlarmHigh" {
+  alarm_name          = "CPUAlarmHigh"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "60"
+  statistic           = "Average"
+  threshold           = "90"
+
+  dimensions = {
+    AutoScalingGroupName = "${aws_autoscaling_group.autoscale-group.name}"
+  }
+
+  alarm_description = "Scale-up if CPU > 50% for 60 seconds"
+  alarm_actions     = ["${aws_autoscaling_policy.WebServerScaleUpPolicy.arn}"]
+}
+
+resource "aws_autoscaling_policy" "WebServerScaleDownPolicy" {
+  name                   = "WebServerScaleDownPolicy"
+  scaling_adjustment     = -1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 60
+  autoscaling_group_name = "${aws_autoscaling_group.autoscale-group.name}"
+}
+
+
+resource "aws_cloudwatch_metric_alarm" "CPUAlarmLow" {
+  alarm_name          = "CPUAlarmLow"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = "60"
+  statistic           = "Average"
+  threshold           = "3"
+
+  dimensions = {
+    AutoScalingGroupName = "${aws_autoscaling_group.autoscale-group.name}"
+  }
+
+  alarm_description = "Scale-up if CPU < 30% for 60 seconds"
+  alarm_actions     = ["${aws_autoscaling_policy.WebServerScaleDownPolicy.arn}"]
+}
 
 
 
 
+resource "aws_lb" "lb-webapp" {
+  name               = "lb-webapp"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.my_sg.id]
+  subnets            = [aws_subnet.subnet.id,aws_subnet.subnet1.id,aws_subnet.subnet2.id]
+
+  enable_deletion_protection = false
+
+  tags = {
+    name = "lb-webapp"
+  }
+}
+
+resource "aws_lb_target_group" "lb-target-group" {
+  name     = "lb-target-group"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.aws_demo.id
+
+
+  stickiness {
+    type = "lb_cookie"
+    enabled = true
+  }
+}
+
+resource "aws_lb_listener" "lb-listener" {
+  load_balancer_arn = "${aws_lb.lb-webapp.arn}"
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = "${aws_lb_target_group.lb-target-group.arn}"
+  }
+}
+
+
+# resource "aws_lb_target_group_attachment" "test" {
+#   target_group_arn = "${aws_lb_target_group.lb-target-group.arn}"
+#   target_id        = "${aws_instance.web.id}"
+#   port             = 80
+# }
+
+
+resource "aws_route53_record" "www" {
+  zone_id = "Z0749463321KIEFGL34KC"
+  name    = ""
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.lb-webapp.dns_name
+    zone_id                = aws_lb.lb-webapp.zone_id
+    evaluate_target_health = true
+  }
+}
+
+
+#create lambda policy
+
+resource "aws_iam_role" "iam_for_lambda" {
+  name = "iam_for_lambda"
+
+  assume_role_policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      },
+      "Effect": "Allow",
+      "Sid": ""
+    }
+  ]
+}
+EOF
+}
+resource "aws_iam_role_policy_attachment" "AWSLambdaBasicExecutionRole" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  role       = "${aws_iam_role.iam_for_lambda.name}"
+}
+
+resource "aws_iam_role_policy_attachment" "EC2-SNS-Access" {
+  policy_arn = "arn:aws:iam::682607698449:policy/EC2-SNS-Access"
+  role       = "${aws_iam_role.EC2_Role.name}"
+}
+
+resource "aws_iam_role_policy_attachment" "Lambda-DynamoDB-Access" {
+  policy_arn = "arn:aws:iam::682607698449:policy/Lambda-DynamoDB-Access"
+  role       = "${aws_iam_role.iam_for_lambda.name}"
+}
+
+resource "aws_iam_role_policy_attachment" "Lambda-SES-Access" {
+  policy_arn = "arn:aws:iam::682607698449:policy/Lambda-SES-Access"
+  role       = "${aws_iam_role.iam_for_lambda.name}"
+}
+
+
+# Lamba Function
+
+resource "aws_lambda_function" "test_lambda" {
+  filename      = "webapp.zip"
+  function_name = "lambda_function_name"
+  role          = "${aws_iam_role.iam_for_lambda.arn}"
+  handler       = "handler.my_handler"
+
+  source_code_hash = "${filebase64sha256("webapp.zip")}"
+
+  runtime = "python3.8"
+
+}
+
+
+#  SNS Topic
+
+resource "aws_sns_topic" "user_updates" {
+  name = "sns_topic"
+}
+
+#  SNS Subscription
+
+resource "aws_sns_topic_subscription" "user_updates_sqs_target" {
+  topic_arn = aws_sns_topic.user_updates.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.test_lambda.arn
+}
+
+resource "aws_lambda_permission" "with_sns" {
+  statement_id  = "AllowExecutionFromSNS"
+  action        = "lambda:InvokeFunction"
+  function_name = "${aws_lambda_function.test_lambda.function_name}"
+  principal     = "sns.amazonaws.com"
+  source_arn    = "${aws_sns_topic.user_updates.arn}"
+}
+
+#  Code Deploy Lambda
+# resource "aws_codedeploy_app" "csye6225-lambda" {
+#   compute_platform = "Lambda"
+#   name             = "csye6225-lambda"
+# }
+
+
+#  Deployment Config for Lambda
+# resource "aws_codedeploy_deployment_config" "foo" {
+#   deployment_config_name = "test-deployment-config"
+#   compute_platform       = "Lambda"
+
+#   traffic_routing_config {
+#     type = "AllAtOnce"
+#   }
+# }
+
+
+# #  Deployment for Lambda
+
+
+# resource "aws_codedeploy_deployment_group" "csye6225-lambda-deployment" {
+#   app_name              = "${aws_codedeploy_app.csye6225-lambda.name}"
+#   deployment_group_name = "csye6225-lambda-deployment"
+#   service_role_arn      = "${aws_iam_role.CodeDeployLambdaServiceRole.arn}"
+#   deployment_config_name = "${aws_codedeploy_deployment_config.foo.id}"
+#   deployment_style {
+#     deployment_option = "WITH_TRAFFIC_CONTROL"
+#     deployment_type   = "BLUE_GREEN"
+#   }
+
+#   auto_rollback_configuration {
+#     enabled = true
+#     events  = ["DEPLOYMENT_STOP_ON_ALARM"]
+#   }  
+
+# }
