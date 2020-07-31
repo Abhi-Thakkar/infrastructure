@@ -153,13 +153,14 @@ resource "aws_security_group" "my_sg" {
   name        = "Demo SG"
   description = "Allow TLS inbound traffic"
   vpc_id      = aws_vpc.aws_demo.id
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+
+  # ingress {
+  #   description = "SSH"
+  #   from_port   = 22
+  #   to_port     = 22
+  #   protocol    = "tcp"
+  #   cidr_blocks = ["0.0.0.0/0"]
+  # }
   ingress {
     description = "HTTPS"
     from_port   = 443
@@ -172,16 +173,17 @@ resource "aws_security_group" "my_sg" {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    security_groups = [aws_security_group.lb_sg.id]
+    
   }
 
-  ingress {
-    description = "WebApp"
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # ingress {
+  #   description = "WebApp"
+  #   from_port   = 8080
+  #   to_port     = 8080
+  #   protocol    = "tcp"
+  #   cidr_blocks = ["0.0.0.0/0"]
+  # }
   egress {
     from_port   = 0
     to_port     = 0
@@ -284,9 +286,12 @@ resource "aws_db_instance" "default" {
   username          = var.db_user
   password          = var.db_pass
   identifier        = "csye6225-su2020"
-  db_subnet_group_name = "db_group"
+  db_subnet_group_name = aws_db_subnet_group.db_group.name
   skip_final_snapshot = true
   vpc_security_group_ids = [aws_security_group.mydb_sg.id]
+  parameter_group_name = aws_db_parameter_group.parameter-group.name
+  storage_encrypted    = true
+
 }
 
 
@@ -709,9 +714,6 @@ resource "aws_iam_role_policy_attachment" "CodeDeployServiceRole" {
 #   name = "webapp"
 # }
 
-resource "aws_sns_topic" "webapp" {
-  name = "webapp-topic"
-}
 
 resource "aws_codedeploy_deployment_group" "csye6225-webapp-deployment" {
   app_name              = "${aws_codedeploy_app.csye6225-webapp.name}"
@@ -911,6 +913,43 @@ resource "aws_cloudwatch_metric_alarm" "CPUAlarmLow" {
   alarm_actions     = ["${aws_autoscaling_policy.WebServerScaleDownPolicy.arn}"]
 }
 
+#load balancer sg
+
+resource "aws_security_group" "lb_sg" {
+  name        = "lb_sg"
+  description = "Allow http traffic traffic"
+  vpc_id      = aws_vpc.aws_demo.id
+
+  ingress {
+    description     = "HTTP"
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+   
+
+  }
+  ingress {
+    description     = "HTTPS"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+   
+
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "load balancer SG"
+  }
+}
 
 
 
@@ -918,7 +957,8 @@ resource "aws_lb" "lb-webapp" {
   name               = "lb-webapp"
   internal           = false
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.my_sg.id]
+  # security_groups    = [aws_security_group.my_sg.id]
+  security_groups    = [aws_security_group.lb_sg.id]
   subnets            = [aws_subnet.subnet.id,aws_subnet.subnet1.id,aws_subnet.subnet2.id]
 
   enable_deletion_protection = false
@@ -941,16 +981,16 @@ resource "aws_lb_target_group" "lb-target-group" {
   }
 }
 
-resource "aws_lb_listener" "lb-listener" {
-  load_balancer_arn = "${aws_lb.lb-webapp.arn}"
-  port              = "80"
-  protocol          = "HTTP"
+# resource "aws_lb_listener" "lb-listener" {
+#   load_balancer_arn = "${aws_lb.lb-webapp.arn}"
+#   port              = "80"
+#   protocol          = "HTTP"
 
-  default_action {
-    type             = "forward"
-    target_group_arn = "${aws_lb_target_group.lb-target-group.arn}"
-  }
-}
+#   default_action {
+#     type             = "forward"
+#     target_group_arn = "${aws_lb_target_group.lb-target-group.arn}"
+#   }
+# }
 
 
 # resource "aws_lb_target_group_attachment" "test" {
@@ -1051,6 +1091,48 @@ resource "aws_lambda_permission" "with_sns" {
   principal     = "sns.amazonaws.com"
   source_arn    = "${aws_sns_topic.user_updates.arn}"
 }
+
+resource "aws_lb_listener" "lb-listener" {
+  load_balancer_arn = "${aws_lb.lb-webapp.arn}"
+  port              = "443"
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = "arn:aws:acm:us-east-1:682607698449:certificate/c9c7a90d-e2d5-4827-b201-4549404d6de5"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = "${aws_lb_target_group.lb-target-group.arn}"
+  }
+}
+
+resource "aws_lb_listener" "listener-lb" {
+  load_balancer_arn = "${aws_lb.lb-webapp.arn}"
+  port              = "80"
+  protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+resource "aws_db_parameter_group" "parameter-group" {
+  name   = "rds-pg"
+  family = "postgres11"
+
+  parameter {
+    name  = "rds.force_ssl"
+    value = "1"
+  }
+
+}
+
+
 
 #  Code Deploy Lambda
 # resource "aws_codedeploy_app" "csye6225-lambda" {
